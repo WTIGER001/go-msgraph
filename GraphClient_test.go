@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net/url"
 	"os"
 	"reflect"
@@ -15,6 +16,10 @@ import (
 
 // get graph client config from environment
 var (
+	// Optional: Azure AD Authentication Endpoint, defaults to msgraph.AzureADAuthEndpointGlobal: https://login.microsoftonline.com
+	msGraphAzureADAuthEndpoint string
+	// Optional: Azure AD Authentication Endpoint, defaults to msgraph.ServiceRootEndpointGlobal: https://graph.microsoft.com
+	msGraphServiceRootEndpoint string
 	// Microsoft Graph tenant ID
 	msGraphTenantID string
 	// Microsoft Graph Application ID
@@ -29,6 +34,8 @@ var (
 	msGraphExistingCalendarsOfUser []string
 	// the number of expected results when searching for the msGraphExistingGroupDisplayName with $search or $filter
 	msGraphExistingGroupDisplayNameNumRes uint64
+	// a domain-name for unit tests to create a user or other objects, e.g. contoso.com - omit the @
+	msGraphDomainNameForCreateTests string
 	// the graphclient used to perform all tests
 	graphClient *GraphClient
 	// marker if the calendar tests should be skipped - set if msGraphExistingCalendarsOfUser is empty
@@ -38,7 +45,7 @@ var (
 func getEnvOrPanic(key string) string {
 	var val = os.Getenv(key)
 	if val == "" {
-		panic(fmt.Sprintf("Expected %s to be set but is empty", key))
+		panic(fmt.Sprintf("Expected %s to be set, but is empty", key))
 	}
 	return val
 }
@@ -49,7 +56,14 @@ func TestMain(m *testing.M) {
 	msGraphClientSecret = getEnvOrPanic("MSGraphClientSecret")
 	msGraphExistingGroupDisplayName = getEnvOrPanic("MSGraphExistingGroupDisplayName")
 	msGraphExistingUserPrincipalInGroup = getEnvOrPanic("MSGraphExistingUserPrincipalInGroup")
+	msGraphDomainNameForCreateTests = getEnvOrPanic("MSGraphDomainNameForCreateTests")
 
+	if msGraphAzureADAuthEndpoint = os.Getenv("MSGraphAzureADAuthEndpoint"); msGraphAzureADAuthEndpoint == "" {
+		msGraphAzureADAuthEndpoint = AzureADAuthEndpointGlobal
+	}
+	if msGraphServiceRootEndpoint = os.Getenv("MSGraphServiceRootEndpoint"); msGraphServiceRootEndpoint == "" {
+		msGraphServiceRootEndpoint = ServiceRootEndpointGlobal
+	}
 	if msGraphExistingCalendarsOfUser = strings.Split(os.Getenv("MSGraphExistingCalendarsOfUser"), ","); msGraphExistingCalendarsOfUser[0] == "" {
 		fmt.Println("Skipping calendar tests due to missing 'MSGraphExistingCalendarsOfUser' value")
 		skipCalendarTests = true
@@ -61,15 +75,45 @@ func TestMain(m *testing.M) {
 		panic(fmt.Sprintf("Environment variable \"MSGraphExistingGroupDisplayNameNumRes\" seems to be invalid, cannot be parsed to unsigned integer: %v", err))
 	}
 
-	graphClient, err = NewGraphClient(msGraphTenantID, msGraphApplicationID, msGraphClientSecret)
+	graphClient, err = NewGraphClientWithCustomEndpoint(msGraphTenantID, msGraphApplicationID, msGraphClientSecret, msGraphAzureADAuthEndpoint, msGraphServiceRootEndpoint)
 	if err != nil {
 		panic(fmt.Sprintf("Cannot initialize a new GraphClient, error: %v", err))
 	}
 
+	rand.Seed(time.Now().UnixNano())
+
 	os.Exit(m.Run())
 }
 
+func randomString(n int) string {
+	var runes = []rune("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+	b := make([]rune, n)
+	for i := range b {
+		b[i] = runes[rand.Intn(len(runes))]
+	}
+	return string(b)
+}
+
+func createUnitTestUser(t *testing.T) User {
+	t.Helper()
+	rndstring := randomString(32)
+	user, err := graphClient.CreateUser(User{
+		AccountEnabled:    true,
+		DisplayName:       "go-msgraph unit-test generated user " + time.Now().Format("2006-01-02") + " - random " + rndstring,
+		MailNickname:      "go-msgraph.unit-test.generated." + rndstring,
+		UserPrincipalName: "go-msgraph.unit-test.generated." + rndstring + "@" + msGraphDomainNameForCreateTests,
+		PasswordProfile:   PasswordProfile{Password: randomString(32)},
+	})
+	if err != nil {
+		t.Errorf("Cannot create a new User for unit tests: %v", err)
+	}
+	return user
+}
+
 func TestNewGraphClient(t *testing.T) {
+	if msGraphAzureADAuthEndpoint != AzureADAuthEndpointGlobal || msGraphServiceRootEndpoint != ServiceRootEndpointGlobal {
+		t.Skip("Skipping TestNewGraphClient because the endpoint is not the default - global - endpoint")
+	}
 	type args struct {
 		tenantID      string
 		applicationID string
@@ -103,6 +147,60 @@ func TestNewGraphClient(t *testing.T) {
 			_, err := NewGraphClient(tt.args.tenantID, tt.args.applicationID, tt.args.clientSecret)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("NewGraphClient() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+		})
+	}
+}
+
+func TestNewGraphClientWithCustomEndpoint(t *testing.T) {
+	type args struct {
+		tenantID            string
+		applicationID       string
+		clientSecret        string
+		azureADAuthEndpoint string
+		serviceRootEndpoint string
+	}
+	tests := []struct {
+		name    string
+		args    args
+		wantErr bool
+	}{
+		{
+			name:    "GraphClient from Environment-variables",
+			args:    args{tenantID: msGraphTenantID, applicationID: msGraphApplicationID, clientSecret: msGraphClientSecret, azureADAuthEndpoint: msGraphAzureADAuthEndpoint, serviceRootEndpoint: msGraphServiceRootEndpoint},
+			wantErr: false,
+		}, {
+			name:    "GraphClient fail - wrong tenant ID",
+			args:    args{tenantID: "wrong tenant id", applicationID: msGraphApplicationID, clientSecret: msGraphClientSecret, azureADAuthEndpoint: msGraphAzureADAuthEndpoint, serviceRootEndpoint: msGraphServiceRootEndpoint},
+			wantErr: true,
+		}, {
+			name:    "GraphClient fail - wrong application ID",
+			args:    args{tenantID: msGraphTenantID, applicationID: "wrong application id", clientSecret: msGraphClientSecret, azureADAuthEndpoint: msGraphAzureADAuthEndpoint, serviceRootEndpoint: msGraphServiceRootEndpoint},
+			wantErr: true,
+		}, {
+			name:    "GraphClient fail - wrong client secret",
+			args:    args{tenantID: msGraphTenantID, applicationID: msGraphApplicationID, clientSecret: "wrong client secret", azureADAuthEndpoint: msGraphAzureADAuthEndpoint, serviceRootEndpoint: msGraphServiceRootEndpoint},
+			wantErr: true,
+		}, {
+			name:    "GraphClient fail - wrong Azure AD Authentication Endpoint",
+			args:    args{tenantID: msGraphTenantID, applicationID: msGraphApplicationID, clientSecret: msGraphClientSecret, azureADAuthEndpoint: "completely invalid URL", serviceRootEndpoint: msGraphServiceRootEndpoint},
+			wantErr: true,
+		}, {
+			name:    "GraphClient fail - wrong Azure AD Authentication Endpoint",
+			args:    args{tenantID: msGraphTenantID, applicationID: msGraphApplicationID, clientSecret: msGraphClientSecret, azureADAuthEndpoint: "https://iguess-this-does-not.exist.in.this.dksfowe3834myksweroqiwer.world", serviceRootEndpoint: msGraphServiceRootEndpoint},
+			wantErr: true,
+		}, {
+			name:    "GraphClient fail - wrong Service Root Endpoint",
+			args:    args{tenantID: msGraphTenantID, applicationID: msGraphApplicationID, clientSecret: msGraphClientSecret, azureADAuthEndpoint: msGraphAzureADAuthEndpoint, serviceRootEndpoint: "invalid URL"},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewGraphClientWithCustomEndpoint(tt.args.tenantID, tt.args.applicationID, tt.args.clientSecret, tt.args.azureADAuthEndpoint, tt.args.serviceRootEndpoint)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("NewGraphClientWithCustomEndpoint() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 		})
@@ -490,6 +588,58 @@ func TestGraphClient_GetGroup(t *testing.T) {
 	}
 }
 
+func TestGraphClient_CreateAndDeleteUser(t *testing.T) {
+	var rndstring = randomString(32)
+	tests := []struct {
+		name    string
+		g       *GraphClient
+		want    User
+		wantErr bool
+	}{
+		{
+			name: "Create new User",
+			g:    graphClient,
+			want: User{
+				AccountEnabled:    true,
+				DisplayName:       "go-msgraph unit-test generated user " + time.Now().Format("2006-01-02") + " - random " + rndstring,
+				MailNickname:      "go-msgraph.unit-test.generated." + rndstring,
+				UserPrincipalName: "go-msgraph.unit-test.generated." + rndstring + "@" + msGraphDomainNameForCreateTests,
+				PasswordProfile:   PasswordProfile{Password: randomString(32)},
+			},
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// test CreateUser
+			got, err := tt.g.CreateUser(tt.want)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("GraphClient.CreateUser() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			fmt.Printf("GraphClient.CreateUser() result: %v\n", got)
+			// test DisableAccount
+			err = got.DisableAccount()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("User.DisableAccount() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			// get user again to compare AccountEnabled field
+			got, err = tt.g.GetUser(got.ID)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("GraphClient.GetUser() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if got.AccountEnabled == true {
+				t.Errorf("User.DisableAccount() did not work, AccountEnabled is still true")
+			}
+			// Delete user again
+			err = got.DeleteUser()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("User.DeleteUser() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestGetQueryOptions_Context(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -709,38 +859,61 @@ func TestGraphClient_UnmarshalJSON(t *testing.T) {
 	}{
 		{
 			name:    "All correct",
-			args:    args{data: []byte(fmt.Sprintf("{\"TenantID\": \"%v\", \"ApplicationID\": \"%v\",\"ClientSecret\": \"%v\"}", msGraphTenantID, msGraphApplicationID, msGraphClientSecret))},
+			args:    args{data: []byte(fmt.Sprintf("{\"TenantID\": \"%v\", \"ApplicationID\": \"%v\",\"ClientSecret\": \"%v\", \"AzureADAuthEndpoint\": \"%v\",\"ServiceRootEndpoint\": \"%v\"}", msGraphTenantID, msGraphApplicationID, msGraphClientSecret, msGraphAzureADAuthEndpoint, msGraphServiceRootEndpoint))},
 			wantErr: false,
 		}, {
 			name:    "JSON-syntax error",
-			args:    args{data: []byte(fmt.Sprintf("{\"TenantID\": \"%v\", \"ApplicationID\": \"%v\",\"ClientSecret\": \"%v\"", msGraphTenantID, msGraphApplicationID, msGraphClientSecret))},
+			args:    args{data: []byte(fmt.Sprintf("{\"TenantID\": \"%v\", \"ApplicationID\": \"%v\",\"ClientSecret\": \"%v\", \"AzureADAuthEndpoint\": \"%v\",\"ServiceRootEndpoint\": \"%v\"", msGraphTenantID, msGraphApplicationID, msGraphClientSecret, msGraphAzureADAuthEndpoint, msGraphServiceRootEndpoint))},
 			wantErr: true,
 		}, {
 			name:    "TenantID incorrect",
-			args:    args{data: []byte(fmt.Sprintf("{\"TenantID\": \"%v\", \"ApplicationID\": \"%v\",\"ClientSecret\": \"%v\"}", "wrongtenant", msGraphApplicationID, msGraphClientSecret))},
+			args:    args{data: []byte(fmt.Sprintf("{\"TenantID\": \"%v\", \"ApplicationID\": \"%v\",\"ClientSecret\": \"%v\", \"AzureADAuthEndpoint\": \"%v\",\"ServiceRootEndpoint\": \"%v\"}", "wrongtenant", msGraphApplicationID, msGraphClientSecret, msGraphAzureADAuthEndpoint, msGraphServiceRootEndpoint))},
 			wantErr: true,
 		}, {
 			name:    "TenantID empty",
-			args:    args{data: []byte(fmt.Sprintf("{\"TenantID\": \"%v\", \"ApplicationID\": \"%v\",\"ClientSecret\": \"%v\"}", "", msGraphApplicationID, msGraphClientSecret))},
+			args:    args{data: []byte(fmt.Sprintf("{\"TenantID\": \"%v\", \"ApplicationID\": \"%v\",\"ClientSecret\": \"%v\", \"AzureADAuthEndpoint\": \"%v\",\"ServiceRootEndpoint\": \"%v\"}", "", msGraphApplicationID, msGraphClientSecret, msGraphAzureADAuthEndpoint, msGraphServiceRootEndpoint))},
 			wantErr: true,
 		}, {
 			name:    "ApplicationID incorrect",
-			args:    args{data: []byte(fmt.Sprintf("{\"TenantID\": \"%v\", \"ApplicationID\": \"%v\",\"ClientSecret\": \"%v\"}", msGraphTenantID, "wrongapplication", msGraphClientSecret))},
+			args:    args{data: []byte(fmt.Sprintf("{\"TenantID\": \"%v\", \"ApplicationID\": \"%v\",\"ClientSecret\": \"%v\", \"AzureADAuthEndpoint\": \"%v\",\"ServiceRootEndpoint\": \"%v\"}", msGraphTenantID, "wrongapplication", msGraphClientSecret, msGraphAzureADAuthEndpoint, msGraphServiceRootEndpoint))},
 			wantErr: true,
 		}, {
 			name:    "ApplicationID empty",
-			args:    args{data: []byte(fmt.Sprintf("{\"TenantID\": \"%v\", \"ApplicationID\": \"%v\",\"ClientSecret\": \"%v\"}", msGraphTenantID, "", msGraphClientSecret))},
+			args:    args{data: []byte(fmt.Sprintf("{\"TenantID\": \"%v\", \"ApplicationID\": \"%v\",\"ClientSecret\": \"%v\", \"AzureADAuthEndpoint\": \"%v\",\"ServiceRootEndpoint\": \"%v\"}", msGraphTenantID, "", msGraphClientSecret, msGraphAzureADAuthEndpoint, msGraphServiceRootEndpoint))},
 			wantErr: true,
 		}, {
 			name:    "ClientSecret incorrect",
-			args:    args{data: []byte(fmt.Sprintf("{\"TenantID\": \"%v\", \"ApplicationID\": \"%v\",\"ClientSecret\": \"%v\"}", msGraphTenantID, msGraphApplicationID, "wrongclientsecret"))},
+			args:    args{data: []byte(fmt.Sprintf("{\"TenantID\": \"%v\", \"ApplicationID\": \"%v\",\"ClientSecret\": \"%v\", \"AzureADAuthEndpoint\": \"%v\",\"ServiceRootEndpoint\": \"%v\"}", msGraphTenantID, msGraphApplicationID, "wrongclientsecret", msGraphAzureADAuthEndpoint, msGraphServiceRootEndpoint))},
 			wantErr: true,
 		}, {
 			name:    "ClientSecret empty",
-			args:    args{data: []byte(fmt.Sprintf("{\"TenantID\": \"%v\", \"ApplicationID\": \"%v\",\"ClientSecret\": \"%v\"}", msGraphTenantID, msGraphApplicationID, ""))},
+			args:    args{data: []byte(fmt.Sprintf("{\"TenantID\": \"%v\", \"ApplicationID\": \"%v\",\"ClientSecret\": \"%v\", \"AzureADAuthEndpoint\": \"%v\",\"ServiceRootEndpoint\": \"%v\"}", msGraphTenantID, msGraphApplicationID, "", msGraphAzureADAuthEndpoint, msGraphServiceRootEndpoint))},
 			wantErr: true,
 		},
 	}
+
+	// only test empty endpoints if the endpoint is the default - global - endpoint. Otherwise the default values do not apply.
+	if msGraphAzureADAuthEndpoint == AzureADAuthEndpointGlobal && msGraphServiceRootEndpoint == ServiceRootEndpointGlobal {
+		tests = append(tests, struct {
+			name    string
+			args    args
+			wantErr bool
+		}{
+			name:    "Empty AzureADAuthEndpoint",
+			args:    args{data: []byte(fmt.Sprintf("{\"TenantID\": \"%v\", \"ApplicationID\": \"%v\",\"ClientSecret\": \"%v\",\"ServiceRootEndpoint\": \"%v\"}", msGraphTenantID, msGraphApplicationID, msGraphClientSecret, msGraphServiceRootEndpoint))},
+			wantErr: false,
+		})
+		tests = append(tests, struct {
+			name    string
+			args    args
+			wantErr bool
+		}{
+			name:    "Empty ServiceRootEndpoint",
+			args:    args{data: []byte(fmt.Sprintf("{\"TenantID\": \"%v\", \"ApplicationID\": \"%v\",\"ClientSecret\": \"%v\",\"AzureADAuthEndpoint\": \"%v\"}", msGraphTenantID, msGraphApplicationID, msGraphClientSecret, msGraphAzureADAuthEndpoint))},
+			wantErr: false,
+		})
+	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var unmarshalTest GraphClient
@@ -748,5 +921,12 @@ func TestGraphClient_UnmarshalJSON(t *testing.T) {
 				t.Errorf("GraphClient.UnmarshalJSON() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestGraphClient_String(t *testing.T) {
+	if fmt.Sprintf("GraphClient(TenantID: %v, ApplicationID: %v, ClientSecret: %v...%v, Token validity: [%v - %v])",
+		graphClient.TenantID, graphClient.ApplicationID, graphClient.ClientSecret[0:3], graphClient.ClientSecret[len(graphClient.ClientSecret)-3:], graphClient.token.NotBefore, graphClient.token.ExpiresOn) != graphClient.String() {
+		t.Errorf("GraphClient.String(): String function failed")
 	}
 }

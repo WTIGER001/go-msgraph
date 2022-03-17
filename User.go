@@ -1,6 +1,8 @@
 package msgraph
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -39,7 +41,7 @@ type PasswordProfile struct {
 	Password                             string `json:"password,omitempty"`
 }
 
-func (u *User) String() string {
+func (u User) String() string {
 	return fmt.Sprintf("User(ID: \"%v\", BusinessPhones: \"%v\", DisplayName: \"%v\", GivenName: \"%v\", "+
 		"Mail: \"%v\", MobilePhone: \"%v\", PreferredLanguage: \"%v\", Surname: \"%v\", UserPrincipalName: \"%v\", "+
 		"ActivePhone: \"%v\", DirectAPIConnection: %v)",
@@ -135,7 +137,7 @@ func (u User) GetShortName() string {
 	if len(supn) != 2 {
 		return u.UserPrincipalName
 	}
-	return strings.ToUpper(supn[0])
+	return supn[0]
 }
 
 // GetFullName returns the full name in that format: <firstname> <lastname>
@@ -143,9 +145,85 @@ func (u User) GetFullName() string {
 	return fmt.Sprintf("%v %v", u.GivenName, u.Surname)
 }
 
+// GetMemberGroupsAsStrings returns a list of all group IDs the user is a member of.
+// You can specify the securityGroupsEnabeled parameter to only return security group IDs.
+//
+// opts ...GetQueryOption - only msgraph.GetWithContext is supported.
+//
+// Reference: https://docs.microsoft.com/en-us/graph/api/directoryobject-getmembergroups?view=graph-rest-1.0&tabs=http
+func (u User) GetMemberGroupsAsStrings(securityGroupsEnabeled bool, opts ...GetQueryOption) ([]string, error) {
+	if u.graphClient == nil {
+		return nil, ErrNotGraphClientSourced
+	}
+	return u.graphClient.getMemberGroups(u.ID, securityGroupsEnabeled, opts...)
+}
+
 // PrettySimpleString returns the User-instance simply formatted for logging purposes: {FullName (email) (activePhone)}
 func (u User) PrettySimpleString() string {
 	return fmt.Sprintf("{ %v (%v) (%v) }", u.GetFullName(), u.Mail, u.GetActivePhone())
+}
+
+// UpdateUser patches this user object. Note, only set the fields that should be changed.
+//
+// IMPORTANT: the user cannot be disabled (field AccountEnabled) this way, because the
+// default value of a boolean is false - and hence will not be posted via json - omitempty
+// is used. user func user.DisableAccount() instead.
+//
+// Reference: https://developer.microsoft.com/en-us/graph/docs/api-reference/v1.0/api/user-update
+func (u User) UpdateUser(userInput User, opts ...UpdateQueryOption) error {
+	if u.graphClient == nil {
+		return ErrNotGraphClientSourced
+	}
+	resource := fmt.Sprintf("/users/%v", u.ID)
+
+	bodyBytes, err := json.Marshal(userInput)
+	if err != nil {
+		return err
+	}
+
+	reader := bytes.NewReader(bodyBytes)
+	// Hint: API-call body does not return any data / no json object.
+	err = u.graphClient.makePATCHAPICall(resource, compileUpdateQueryOptions(opts), reader, nil)
+	return err
+}
+
+// DisableAccount disables the User-Account, hence sets the AccountEnabled-field to false.
+// This function must be used instead of user.UpdateUser, because the AccountEnabled-field
+// with json "omitempty" will never be sent when false. Without omitempty, the user account would
+// always accidentially disabled upon an update of e.g. only "DisplayName"
+//
+// Reference: https://developer.microsoft.com/en-us/graph/docs/api-reference/v1.0/api/user-update
+func (u User) DisableAccount(opts ...UpdateQueryOption) error {
+	if u.graphClient == nil {
+		return ErrNotGraphClientSourced
+	}
+	resource := fmt.Sprintf("/users/%v", u.ID)
+
+	bodyBytes, err := json.Marshal(struct {
+		AccountEnabled bool `json:"accountEnabled"`
+	}{AccountEnabled: false})
+	if err != nil {
+		return err
+	}
+
+	reader := bytes.NewReader(bodyBytes)
+	// Hint: API-call body does not return any data / no json object.
+	err = u.graphClient.makePATCHAPICall(resource, compileUpdateQueryOptions(opts), reader, nil)
+	return err
+}
+
+// DeleteUser deletes this user instance at the Microsoft Azure AD. Use with caution.
+//
+// Reference: https://docs.microsoft.com/en-us/graph/api/user-delete
+func (u User) DeleteUser(opts ...DeleteQueryOption) error {
+	if u.graphClient == nil {
+		return ErrNotGraphClientSourced
+	}
+	resource := fmt.Sprintf("/users/%v", u.ID)
+
+	// TODO: check return body, maybe there is some potential success or error message hidden in it?
+	err := u.graphClient.makeDELETEAPICall(resource, compileDeleteQueryOptions(opts), nil)
+	return err
 }
 
 // Equal returns wether the user equals the other User by comparing every property
